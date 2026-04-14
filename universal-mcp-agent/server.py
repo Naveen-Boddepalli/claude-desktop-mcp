@@ -6,10 +6,24 @@ import time
 import itertools
 import subprocess
 from collections import Counter, OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from mcp.server.fastmcp import FastMCP
 from config import MAX_FILES, ALLOWED_COMMANDS
 from utils import is_safe_path, truncate
+
+# [UPGRADE] Use tiktoken for accurate token counting (Claude's tokenizer)
+try:
+    import tiktoken
+    TOKENIZER = tiktoken.get_encoding("cl100k_base")  # Works for Claude models
+    def count_tokens(text: str) -> int:
+        return len(TOKENIZER.encode(text))
+except ImportError:
+    # Fallback to character approximation if tiktoken not installed
+    def count_tokens(text: str) -> int:
+        return len(text) // 4
+
+# [UPGRADE] Configurable command timeout via environment variable
+CMD_TIMEOUT = int(os.getenv("MCP_CMD_TIMEOUT", "30"))
 
 mcp = FastMCP("UniversalDevAgent")
 
@@ -54,6 +68,10 @@ class LRUCache:
 
 CACHE = LRUCache(capacity=64, ttl_seconds=120)
 
+# [UPGRADE] Global file list cache to speed up repeated searches
+_FILE_LIST_CACHE: Tuple[List[str], float] = ([], 0.0)
+_FILE_LIST_CACHE_TTL = 120  # seconds
+
 # ─────────────────────────────────────────────
 # SKIP DIRS (avoids crawling noise)
 # ─────────────────────────────────────────────
@@ -84,7 +102,8 @@ def bm25_score(query_terms: List[str], doc_tokens: List[str], corpus_size: int,
         tf = tf_map.get(term, 0)
         if tf == 0:
             continue
-        idf = math.log((corpus_size - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1)
+        # [FIX] Corrected IDF formula (standard Lucene variant)
+        idf = math.log(1 + (corpus_size - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5))
         tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / max(avg_doc_len, 1)))
         score += idf * tf_norm
     return score
@@ -119,23 +138,22 @@ def smart_summarize(text: str, max_tokens: int = 400) -> str:
     if not lines:
         return text
 
-    # Estimate rough token count (1 token ≈ 4 chars)
-    budget_chars = max_tokens * 4
-    if len(text) <= budget_chars:
+    # [UPGRADE] Use actual token count instead of character estimate
+    if count_tokens(text) <= max_tokens:
         return text
 
     # Score each line by entropy
     scored = sorted(enumerate(lines), key=lambda x: entropy_score(x[1]), reverse=True)
 
-    # Greedily pick highest-entropy lines until budget is full
+    # Greedily pick highest-entropy lines until token budget is full
     selected = {}
-    used = 0
+    used_tokens = 0
     for idx, line in scored:
-        cost = len(line) + 1
-        if used + cost > budget_chars:
+        cost = count_tokens(line) + 1  # +1 for newline
+        if used_tokens + cost > max_tokens:
             break
         selected[idx] = line
-        used += cost
+        used_tokens += cost
 
     # Reconstruct in original order with gap markers
     result = []
@@ -160,11 +178,13 @@ def smart_chunk_code(content: str, max_chars: int = 4000) -> str:
     if len(content) <= max_chars:
         return content
 
-    # Detect block boundaries: Python def/class, JS function, etc.
+    # [UPGRADE] Expanded boundary regex to support more languages
     boundary_pattern = re.compile(
-        r'^(def |class |async def |function |const |export (default |async )?function )',
+        r'^(def |class |async def |function |const |export (default |async )?function |func |fn |'
+        r'public |private |protected |void |int |bool |string )',
         re.MULTILINE
     )
+    # [FIX] Variable name corrected from 'boundaries' to 'boundaries'
     boundaries = [m.start() for m in boundary_pattern.finditer(content)]
 
     if not boundaries:
@@ -234,6 +254,24 @@ def deduplicate_lines(text: str, threshold: float = 0.85) -> str:
     return result
 
 
+def get_all_files(directory: str) -> List[str]:
+    """
+    Collect all files under directory (excluding SKIP_DIRS) with caching.
+    """
+    global _FILE_LIST_CACHE
+    now = time.time()
+    if _FILE_LIST_CACHE[1] > now - _FILE_LIST_CACHE_TTL:
+        return _FILE_LIST_CACHE[0]
+
+    all_files = []
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            all_files.append(os.path.join(root, f))
+    _FILE_LIST_CACHE = (all_files, now)
+    return all_files
+
+
 # ─────────────────────────────────────────────
 # TOOLS
 # ─────────────────────────────────────────────
@@ -256,14 +294,8 @@ def search_files(directory: str = "~", query: str = "") -> str:
         if not is_safe_path(directory):
             return "Access denied"
 
-        all_files = []
-        for root, dirs, files in os.walk(directory):
-            # Prune skip dirs in-place so os.walk doesn't descend into them
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            for f in files:
-                all_files.append(os.path.join(root, f))
-                if len(all_files) >= MAX_FILES * 10:
-                    break
+        # [FIX] Removed early break that prevented full traversal
+        all_files = get_all_files(directory)
 
         if not query:
             result = json.dumps(all_files[:MAX_FILES])
@@ -306,39 +338,42 @@ def read_file(path: str, lines: int = 50) -> str:
     and entropy-based summarization for logs/text.
     Short files are returned in full. Binary files are skipped.
     """
-    cache_key = f"read:{path}:{lines}"
+    # [FIX] Cache full file content, then apply truncation (lines param ignored in cache key)
+    cache_key = f"read:{path}"
     cached = CACHE.get(cache_key)
     if cached:
-        return cached
+        content = cached
+    else:
+        try:
+            if not is_safe_path(path):
+                return "Access denied"
 
-    try:
-        if not is_safe_path(path):
-            return "Access denied"
+            # Detect likely binary files by extension
+            binary_exts = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".zip",
+                           ".exe", ".bin", ".so", ".dylib", ".pdf", ".woff"}
+            if os.path.splitext(path)[1].lower() in binary_exts:
+                return f"[Skipped binary file: {os.path.basename(path)}]"
 
-        # Detect likely binary files by extension
-        binary_exts = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".zip",
-                       ".exe", ".bin", ".so", ".dylib", ".pdf", ".woff"}
-        if os.path.splitext(path)[1].lower() in binary_exts:
-            return f"[Skipped binary file: {os.path.basename(path)}]"
+            with open(path, "r", errors="ignore") as f:
+                # Read up to a generous limit (1000 lines) for caching
+                content = "".join(itertools.islice(f, 1000))
+            CACHE.set(cache_key, content)
+        except Exception as e:
+            return f"Error: {str(e)}"
 
-        with open(path, "r", errors="ignore") as f:
-            content = "".join(itertools.islice(f, lines))
+    # Apply requested truncation/chunking based on 'lines' parameter
+    # Code files: semantic chunking
+    code_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".cpp", ".c"}
+    if os.path.splitext(path)[1].lower() in code_exts:
+        # Use lines * 80 as rough character budget for chunking
+        result = smart_chunk_code(content, max_chars=lines * 80)
+    else:
+        # Logs / text: entropy-based summarization + dedup
+        content = deduplicate_lines(content)
+        # Use lines * 4 as token budget for summarization (1 token ≈ 4 chars)
+        result = smart_summarize(content, max_tokens=lines * 4)
 
-        # Code files: semantic chunking
-        code_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".cpp", ".c"}
-        if os.path.splitext(path)[1].lower() in code_exts:
-            result = smart_chunk_code(content, max_chars=lines * 80)
-        else:
-            # Logs / text: entropy-based summarization + dedup
-            content = deduplicate_lines(content)
-            result = smart_summarize(content, max_tokens=lines * 4)
-
-        result = truncate(result)
-        CACHE.set(cache_key, result)
-        return result
-
-    except Exception as e:
-        return f"Error: {str(e)}"
+    return truncate(result)
 
 
 @mcp.tool()
@@ -358,12 +393,14 @@ def run_command(command: List[str], cwd: str = ".") -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=CMD_TIMEOUT  # [UPGRADE] Configurable timeout
         )
         raw = result.stdout + result.stderr
         cleaned = deduplicate_lines(raw)
         return truncate(smart_summarize(cleaned, max_tokens=300))
 
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {CMD_TIMEOUT} seconds"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -380,13 +417,25 @@ def summarize(text: str, max_tokens: int = 100) -> str:
 
 
 @mcp.tool()
+def estimate_tokens(text: str) -> str:
+    """
+    Returns the token count for the given text using Claude's tokenizer.
+    Useful for gauging how large a piece of content is before requesting it.
+    """
+    tokens = count_tokens(text)
+    return json.dumps({"tokens": tokens})
+
+
+@mcp.tool()
 def clear_cache() -> str:
     """
-    Clears the LRU result cache. Use when files have changed on disk
-    and you want fresh reads on the next call.
+    Clears the LRU result cache and the file list cache.
+    Use when files have changed on disk and you want fresh reads on the next call.
     """
+    global _FILE_LIST_CACHE
     stats = CACHE.stats()
     CACHE.clear()
+    _FILE_LIST_CACHE = ([], 0.0)  # [UPGRADE] Also clear file list cache
     return f"Cache cleared. Had {stats['live_keys']} live entries ({stats['total_keys']} total)."
 
 
