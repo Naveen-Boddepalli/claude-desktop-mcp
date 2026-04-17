@@ -47,7 +47,8 @@ claude-mcp/
     ├── utils.py           ← is_safe_path(), truncate()
     ├── requirements.txt   ← Python dependencies
     ├── skills/
-    │   └── SKILL.md       ← token-efficient-developer skill (caveman + MCP behavior)
+    │   ├── claude-skills/
+    │       └── SKILL.md       ← token-efficient-developer skill (caveman + MCP behavior)
     └── venv/              ← virtual environment
 ```
 
