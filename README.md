@@ -13,9 +13,10 @@ A local Model Context Protocol (MCP) server that gives Claude secure, token-effi
 5. [Tools reference](#tools-reference)
 6. [Token efficiency algorithms](#token-efficiency-algorithms)
 7. [Security model](#security-model)
-8. [Tips for efficient use](#tips-for-efficient-use)
-9. [Tuning the server](#tuning-the-server)
-10. [Troubleshooting](#troubleshooting)
+8. [Skills](#skills)
+9. [Tips for efficient use](#tips-for-efficient-use)
+10. [Tuning the server](#tuning-the-server)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -45,6 +46,8 @@ claude-mcp/
     ├── config.py          ← MAX_OUTPUT, ALLOWED_ROOTS, ALLOWED_COMMANDS
     ├── utils.py           ← is_safe_path(), truncate()
     ├── requirements.txt   ← Python dependencies
+    ├── skills/
+    │   └── SKILL.md       ← token-efficient-developer skill (caveman + MCP behavior)
     └── venv/              ← virtual environment
 ```
 
@@ -338,6 +341,42 @@ ALLOWED_COMMANDS = [
     "cat",   # add only commands you trust
 ]
 ```
+
+---
+
+## Skills
+
+`skills/SKILL.md` is a companion behavior file for Claude. It combines two things into one file:
+
+- **Caveman output compression** — drops filler words and hedging from Claude's responses, cutting output tokens ~65% while keeping full technical accuracy.
+- **MCP tool discipline** — tells Claude how to use the server's tools efficiently: search before reading, default to 50 lines, stop as soon as enough context exists.
+
+### Loading the skill
+
+In Claude Desktop, paste this into your conversation at the start of a session:
+
+```
+Use the skill at ~/claude-mcp/universal-mcp-agent/skills/SKILL.md
+```
+
+Or read it once with the MCP server itself:
+
+```
+read_file(path="~/claude-mcp/universal-mcp-agent/skills/SKILL.md")
+```
+
+### Intensity levels
+
+By default the skill uses **full** caveman mode. Switch mid-session with:
+
+| Command | Effect |
+|---|---|
+| `/caveman lite` | Drop filler, keep articles and full sentences |
+| `/caveman full` | Drop articles, fragments OK — default |
+| `/caveman ultra` | Max compression, arrows for causality, abbreviate everything |
+| `stop caveman` | Back to normal prose |
+
+Code blocks, commits, and security warnings are always written normally regardless of mode.
 
 ---
 
